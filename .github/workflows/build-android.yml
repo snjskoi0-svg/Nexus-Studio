@@ -1,145 +1,140 @@
-name: Nexus Studio — Advanced Android APK Builder
+name: Nexus Studio 0.1.4 — Android APK Builder
 
 on:
   workflow_dispatch:
     inputs:
       run_tests:
-        description: "Executar testes do motor de timeline antes do APK"
-        required: true
+        description: "Executar testes antes de compilar"
         type: boolean
+        required: true
         default: true
   push:
     branches: [main, master]
     paths:
-      - "nexus-studio-0.1.2-github-apk-builder.zip"
+      - "nexus-studio-0.1.4-updated-apk-builder.zip"
       - ".github/workflows/build-android.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: nexus-studio-android-${{ github.ref }}
+  group: nexus-studio-apk-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build and verify debug APK
+    name: Test, compile and package APK
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-
+    timeout-minutes: 40
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate and extract project ZIP
+      - name: Validate and extract project archive
+        id: project
         shell: bash
         run: |
           set -euo pipefail
-          ZIP="nexus-studio-0.1.2-github-apk-builder.zip"
-          test -s "$ZIP" || { echo "::error::Não encontrei $ZIP na raiz do repositório."; exit 1; }
+          ZIP="nexus-studio-0.1.4-updated-apk-builder.zip"
+          if [ ! -s "$ZIP" ]; then
+            echo "::error::Envie $ZIP para a raiz do repositório antes de executar o workflow."
+            exit 1
+          fi
           unzip -tq "$ZIP"
           mkdir -p "$RUNNER_TEMP/nexus-source"
           unzip -q "$ZIP" -d "$RUNNER_TEMP/nexus-source"
-          test -f "$RUNNER_TEMP/nexus-source/nexus-studio/package.json"
-          test -f "$RUNNER_TEMP/nexus-source/nexus-studio/apps/android/settings.gradle.kts"
-          echo "PROJECT_DIR=$RUNNER_TEMP/nexus-source/nexus-studio" >> "$GITHUB_ENV"
+          PROJECT="$RUNNER_TEMP/nexus-source/nexus-studio"
+          test -f "$PROJECT/package.json"
+          test -f "$PROJECT/apps/web/package.json"
+          test -f "$PROJECT/apps/android/settings.gradle.kts"
+          test -f "$PROJECT/apps/android/app/build.gradle.kts"
+          echo "path=$PROJECT" >> "$GITHUB_OUTPUT"
 
-      - name: Configure Node.js
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Configure Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android platform and build tools
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Install web dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
-          fi
+      - name: Install npm dependencies
+        working-directory: ${{ steps.project.outputs.path }}
+        run: npm install --no-audit --no-fund
 
-      - name: Run timeline engine tests
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_tests || github.event_name == 'push' }}
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: npm test --if-present
+      - name: Test timeline engine
+        if: ${{ github.event_name == 'push' || inputs.run_tests }}
+        working-directory: ${{ steps.project.outputs.path }}
+        run: npm test
 
       - name: Build web editor
-        working-directory: ${{ env.PROJECT_DIR }}
+        working-directory: ${{ steps.project.outputs.path }}
         run: npm run build
 
-      - name: Prepare Android WebView assets
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Copy web app into Android WebView assets
+        working-directory: ${{ steps.project.outputs.path }}
         shell: bash
         run: |
           set -euo pipefail
-          test -d apps/web/dist
+          test -s apps/web/dist/index.html
           mkdir -p apps/android/app/src/main/assets
           rm -rf apps/android/app/src/main/assets/*
           cp -R apps/web/dist/. apps/android/app/src/main/assets/
           test -s apps/android/app/src/main/assets/index.html
 
-      - name: Install Gradle 8.9
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --location --retry 3 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
-          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/gradle-8.9/bin" >> "$GITHUB_PATH"
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
 
-      - name: Assemble Android debug APK
-        working-directory: ${{ env.PROJECT_DIR }}/apps/android
+      - name: Compile debug APK
+        working-directory: ${{ steps.project.outputs.path }}/apps/android
         run: gradle --no-daemon --stacktrace --warning-mode all assembleDebug
 
-      - name: Verify APK and calculate SHA-256
+      - name: Verify APK and prepare checksums
+        id: package
+        working-directory: ${{ steps.project.outputs.path }}
         shell: bash
-        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
           APK="apps/android/app/build/outputs/apk/debug/app-debug.apk"
-          test -s "$APK" || { echo "::error::O APK não foi gerado."; exit 1; }
+          test -s "$APK" || { echo "::error::O build terminou sem produzir APK."; exit 1; }
           mkdir -p "$RUNNER_TEMP/nexus-release"
-          cp "$APK" "$RUNNER_TEMP/nexus-release/Nexus-Studio-debug.apk"
-          sha256sum "$RUNNER_TEMP/nexus-release/Nexus-Studio-debug.apk" | tee "$RUNNER_TEMP/nexus-release/SHA256SUMS.txt"
+          cp "$APK" "$RUNNER_TEMP/nexus-release/Nexus-Studio-0.1.4-debug.apk"
+          sha256sum "$RUNNER_TEMP/nexus-release/Nexus-Studio-0.1.4-debug.apk" > "$RUNNER_TEMP/nexus-release/SHA256SUMS.txt"
+          APK_SIZE=$(du -h "$RUNNER_TEMP/nexus-release/Nexus-Studio-0.1.4-debug.apk" | cut -f1)
           {
-            echo "## Nexus Studio APK"
+            echo "## Nexus Studio 0.1.4 — resultado do build"
+            echo "- APK: **gerado e verificado**"
+            echo "- Tipo: debug (teste; não é uma versão assinada para Play Store)"
+            echo "- Tamanho: $APK_SIZE"
+            echo "- Android mínimo: API 26, conforme configuração do projeto"
             echo ""
-            echo "- Build: sucesso"
-            echo "- Tipo: debug APK (teste)"
-            echo "- Android mínimo configurado: API 26"
-            echo "- Versão: 0.1.2"
-            echo ""
-            echo 'O APK está anexado no artefato `nexus-studio-android-apk`.'
-            echo ""
-            echo "SHA-256:"
+            echo "### SHA-256"
             echo '```text'
             cat "$RUNNER_TEMP/nexus-release/SHA256SUMS.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload installable APK and checksum
+      - name: Upload APK and SHA-256
         uses: actions/upload-artifact@v4
         with:
-          name: nexus-studio-android-apk
+          name: nexus-studio-0.1.4-android-apk
           path: |
-            ${{ runner.temp }}/nexus-release/Nexus-Studio-debug.apk
+            ${{ runner.temp }}/nexus-release/Nexus-Studio-0.1.4-debug.apk
             ${{ runner.temp }}/nexus-release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
